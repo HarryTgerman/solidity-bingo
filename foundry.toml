@@ -1,2 +1,3 @@
 [profile.ci.fuzz]
 runs = 10_000
+remappings = ["@openzeppelin/=lib/openzeppelin-contracts/"]
