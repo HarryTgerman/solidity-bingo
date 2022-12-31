@@ -1,8 +1,11 @@
 pragma solidity 0.8.17;
 
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/security/ReentrancyGuard.sol";
+import {IERC20} from "@openzeppelin/token/ERC20/IERC20.sol";
 
-contract Bingo {
+contract Bingo is ReentrancyGuard {
+    using SafeERC20 for IERC20;
     // Parameters
     uint32 public minimumJoinDuration;
     uint32 public minimumTurnDuration;
@@ -11,12 +14,14 @@ contract Bingo {
     uint32 public CurrentGame;
 
     // ERC20 token
-    SafeERC20 public token;
+    IERC20 public token;
 
     // Admin
     address public admin;
 
     mapping(uint32 => Game) public games;
+    mapping(bytes32 => uint8[25]) playerBoard;
+    mapping(bytes32 => bool) players;
     mapping(address => uint32[]) public playerGames;
 
     // Game state
@@ -28,8 +33,6 @@ contract Bingo {
         uint256 pot;
         address winner;
         uint8[] numbersDrawn;
-        mapping(address => uint8[25]) playerBoard;
-        mapping(address => bool) players;
     }
 
     // errors
@@ -37,16 +40,22 @@ contract Bingo {
     error NotPlayer();
     error JoinDurationPassed();
     error GameEnded();
+    error GameHasStarted();
     error MinimumJoinDurationNotPassed();
     error MinimumTurnDurationNotPassed();
     error NotEnoughNumbersDrawn();
     error NoNumbersDrawn();
     error GameDoesNotExist();
+    error PlayerAlreadyJoined();
 
     // Events
-    event GameStarted(uint32 indexed gameId, uint64 startTime, uint64 endTime);
+    event GameStarted(uint32 indexed gameId, uint256 startTime, uint64 endTime);
     event NumberDrawn(uint32 indexed gameId, uint8 number);
-    event PlayerJoined(address indexed player, uint32 indexed gameId);
+    event PlayerJoined(
+        address indexed player,
+        uint32 indexed gameId,
+        uint8[25] board
+    );
     event PlayerLeft(address indexed player, uint32 indexed gameId);
     event PlayerWon(
         address indexed player,
@@ -54,15 +63,87 @@ contract Bingo {
         uint256 amountWon
     );
 
-    constructor(SafeERC20 _token) public {
+    constructor(address _token) public {
         admin = msg.sender;
-        token = _token;
+        token = IERC20(_token);
+    }
+
+    // get game info
+    function getGame(uint32 _gameId)
+        public
+        view
+        returns (
+            uint64 startTime,
+            uint64 endTime,
+            uint64 lastDrawTime,
+            bool ended,
+            uint256 pot,
+            address winner,
+            uint8[] memory numbersDrawn
+        )
+    {
+        Game storage game = games[_gameId];
+        return (
+            game.startTime,
+            game.endTime,
+            game.lastDrawTime,
+            game.ended,
+            game.pot,
+            game.winner,
+            game.numbersDrawn
+        );
+    }
+
+    //get player board
+    function getPlayerBoard(uint32 _gameId, address _player)
+        public
+        view
+        returns (uint8[25] memory)
+    {
+        bytes32 playerGameId = hashPlayerGameId(_gameId, _player);
+        return playerBoard[playerGameId];
+    }
+
+    // get if player in game
+    function getPlayerInGame(uint32 _gameId, address _player)
+        public
+        view
+        returns (bool)
+    {
+        bytes32 playerGameId = hashPlayerGameId(_gameId, _player);
+        return players[playerGameId];
+    }
+
+    // get numbers drawn in a game
+    function getNumbersDrawn(uint32 _gameId)
+        public
+        view
+        returns (uint8[] memory)
+    {
+        Game storage game = games[_gameId];
+        return game.numbersDrawn;
+    }
+
+    // get player winnings in all games
+    function getPlayerWinnings(address _player)
+        public
+        view
+        returns (uint256 winnings)
+    {
+        uint32[] memory playerGamesArray = playerGames[_player];
+        for (uint256 i = 0; i < playerGamesArray.length; i++) {
+            uint32 gameId = playerGamesArray[i];
+            Game storage game = games[gameId];
+            if (game.winner == _player) {
+                winnings += game.pot;
+            }
+        }
     }
 
     // Change the game parameters
     function updateParams(
-        uint64 _minimumJoinDuration,
-        uint64 _minimumTurnDuration,
+        uint32 _minimumJoinDuration,
+        uint32 _minimumTurnDuration,
         uint128 _entryFee
     ) public {
         if (msg.sender != admin) {
@@ -75,13 +156,16 @@ contract Bingo {
 
     // Start a new game
     function startGame() external {
-        uint256 currentGame = CurrentGame;
-        Game memory game;
-        game.startTime = now;
-        game.endTime = now.add(minimumJoinDuration);
-        games[currentGame++] = game;
+        uint32 currentGame = CurrentGame;
+        Game storage game = games[currentGame + 1];
+        game.startTime = uint64(block.timestamp);
+        game.endTime = uint64(block.timestamp) + minimumJoinDuration;
         CurrentGame++;
-        emit GameStarted(currentGame++, now, now.add(minimumJoinDuration));
+        emit GameStarted(
+            currentGame++,
+            uint64(block.timestamp),
+            uint64(block.timestamp) + minimumJoinDuration
+        );
     }
 
     // Draw a number and mark it on all players' boards
@@ -89,37 +173,48 @@ contract Bingo {
         if (_gameId > CurrentGame) {
             revert GameDoesNotExist();
         }
-        Game memory game = games[_gameId];
-        if (!game.players[msg.sender]) {
-            revert NotPlayer();
+        Game storage game = games[_gameId];
+        if (game.ended) {
+            revert GameEnded();
         }
-        if (now < game.endTime) {
+        if (block.timestamp < uint256(game.endTime)) {
             revert MinimumJoinDurationNotPassed();
         }
-        if (now > (game.lastDrawTime + minimumTurnDuration)) {
+        if (
+            block.timestamp < uint256((game.lastDrawTime + minimumTurnDuration))
+        ) {
             revert MinimumTurnDurationNotPassed();
         }
 
         uint8 number = uint8(
-            bytes32(keccak256(abi.encodePacked(blockhash(block.number - 1))))
+            uint256(
+                bytes32(
+                    keccak256(abi.encodePacked(blockhash(block.number - 1)))
+                )
+            )
         );
         game.numbersDrawn.push(number);
-        game.lastDrawTime = now;
+        game.lastDrawTime = uint64(block.timestamp);
         // not checking for winning condition here to prevent unbounded loops (run out of gas)
         emit NumberDrawn(_gameId, number);
     }
 
     // Mark the board of a player and check if they have won
-    function checkBoard(uint32 _gameId, address _player) public {
+    function checkBoard(uint32 _gameId, address _player) public nonReentrant {
         if (_gameId > CurrentGame) {
             revert GameDoesNotExist();
         }
         Game memory game = games[_gameId];
+        bytes32 playerGameId = hashPlayerGameId(_gameId, _player);
+
         if (game.ended) {
             revert GameEnded();
         }
-        if (!game.players[_player]) {
+        if (!players[playerGameId]) {
             revert NotPlayer();
+        }
+        if (block.timestamp < uint256(game.endTime)) {
+            revert MinimumJoinDurationNotPassed();
         }
         if (game.numbersDrawn.length == 0) {
             revert NoNumbersDrawn();
@@ -128,13 +223,12 @@ contract Bingo {
             revert NotEnoughNumbersDrawn();
         }
 
-        uint8[25] memory board = game.playerBoard[player];
-        uint8[] memory numbersChecked;
+        uint8[25] memory board = playerBoard[playerGameId];
         // Mark the numbers on the board
         for (uint256 i = 0; i < game.numbersDrawn.length; i++) {
             // todo exclude numbers that have already been marked
 
-            for (uint8 j = 0; j < 25; j++) {
+            for (uint256 j = 0; j < 25; j++) {
                 if (board[j] == 0) {
                     continue;
                 }
@@ -144,7 +238,7 @@ contract Bingo {
             }
         }
 
-        game.playerBoard[_player] = board;
+        playerBoard[playerGameId] = board;
 
         if (checkWin(board)) {
             // Distribute the winnings to the winner
@@ -156,7 +250,7 @@ contract Bingo {
     }
 
     // Check if any player has achieved a Bingo
-    function checkWin() internal returns (bool) {
+    function checkWin(uint8[25] memory _board) internal pure returns (bool) {
         for (uint8 i = 0; i < 5; i++) {
             // Check rows
             if (
@@ -197,50 +291,57 @@ contract Bingo {
         ) {
             return true;
         }
+        return false;
     }
 
     // Join the game
-    function joinGame(uint64 _gameId) public payable nonReentrant {
+    function joinGame(uint32 _gameId) public payable nonReentrant {
         if (_gameId > CurrentGame) {
             revert GameDoesNotExist();
         }
 
         Game memory game = games[_gameId];
+        bytes32 playerGameId = hashPlayerGameId(_gameId, msg.sender);
 
         if (game.ended) {
             revert GameEnded();
         }
-        if (game.players[msg.sender]) {
-            revert PlayerJoined();
+        if (players[playerGameId]) {
+            revert PlayerAlreadyJoined();
         }
-        if (now > game.endTime) {
+        if (block.timestamp > game.endTime) {
             revert JoinDurationPassed();
         }
 
         token.transferFrom(msg.sender, address(this), entryFee);
-        games[_gameId].players[msg.sender] = true;
-        unchecked {
-            games[_gameId].pot = +entryFee;
-        }
+
+        players[playerGameId] = true;
+        games[_gameId].pot += entryFee;
 
         uint8[25] memory board;
 
-        for (uint8 i = 0; i < 25; i++) {
+        uint256 random = uint256(
+            bytes32(keccak256(abi.encodePacked(blockhash(block.number - 1))))
+        );
+
+        for (uint256 i = 0; i < 25; i++) {
             if (i == 12) {
                 board[i] = 0;
                 continue;
             }
-            uint8 number = uint8(
-                bytes32(
-                    keccak256(abi.encodePacked(blockhash(block.number - i)))
-                )
-            );
+            uint8 number = uint8(random >> (i * 8));
+            if (number == 0) {
+                // 0 is not a valid number
+                number = 88;
+            }
             board[i] = number;
         }
 
+        playerBoard[playerGameId] = board;
+
         playerGames[msg.sender].push(_gameId);
 
-        emit PlayerJoined(_gameId, msg.sender, board);
+        emit PlayerJoined(msg.sender, _gameId, board);
     }
 
     // Leave the game
@@ -249,28 +350,39 @@ contract Bingo {
             revert GameDoesNotExist();
         }
         Game memory game = games[_gameId];
-        if (game.ended) {
-            revert GameEnded();
-        }
-        if (!game.players[msg.sender]) {
+        bytes32 playerGameId = hashPlayerGameId(_gameId, msg.sender);
+
+        if (!players[playerGameId]) {
             revert NotPlayer();
         }
-        games[_gameId].players[msg.sender] = false;
-        games[_gameId].pot = -entryFee;
-        uint245[] memory localPlayerGames = playerGames[msg.sender];
+        if (game.endTime < uint64(block.timestamp)) {
+            revert GameHasStarted();
+        }
+
+        players[playerGameId] = false;
+        games[_gameId].pot -= entryFee;
+        uint32[] memory localPlayerGames = playerGames[msg.sender];
         // remove the game from the player's list of games
         for (uint256 i = 0; i < localPlayerGames.length; i++) {
             if (localPlayerGames[i] == _gameId) {
-                localPlayerGames[i] = localPlayerGames[
+                playerGames[msg.sender][i] = playerGames[msg.sender][
                     localPlayerGames.length - 1
                 ];
-                localPlayerGames.pop();
-                playerGames[msg.sender] = localPlayerGames;
+                playerGames[msg.sender].pop();
                 break;
             }
         }
         token.transfer(msg.sender, entryFee);
 
-        emit PlayerLeft(_gameId, msg.sender);
+        emit PlayerLeft(msg.sender, _gameId);
+    }
+
+    // hash player game id
+    function hashPlayerGameId(uint32 _gameId, address _player)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encodePacked(_gameId, _player));
     }
 }
