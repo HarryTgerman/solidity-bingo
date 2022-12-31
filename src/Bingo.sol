@@ -249,9 +249,15 @@ contract Bingo is ReentrancyGuard {
         }
     }
 
+    //  0  1  2  3  4
+    //  5  6  7  8  9
+    // 10 11 12 13 14
+    // 15 16 17 18 19
+    // 20 21 22 23 24
+
     // Check if any player has achieved a Bingo
     function checkWin(uint8[25] memory _board) internal pure returns (bool) {
-        for (uint8 i = 0; i < 5; i++) {
+        for (uint256 i = 0; i < 5; i++) {
             // Check rows
             if (
                 _board[i * 5] == 0 &&
