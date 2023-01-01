@@ -63,7 +63,7 @@ contract Bingo is ReentrancyGuard {
         uint256 amountWon
     );
 
-    constructor(address _token) public {
+    constructor(address _token) {
         admin = msg.sender;
         token = IERC20(_token);
     }

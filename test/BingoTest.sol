@@ -200,22 +200,44 @@ contract TestBingo is Test {
         helperDrawNumbers(1, 5);
         bingo.checkBoard(1, playerOne);
 
-        helperDrawNumbers(1, 300);
-        bingo.checkBoard(1, playerOne);
+        // draw numbers until player one wins
+        (, , , , , address winner, ) = bingo.getGame(1);
+        uint256 j = 0;
+        // vm.roll(123141);
+        // vm.roll(2321);
+        vm.roll(2343);
+
+        while (winner != playerOne && j < 300) {
+            vm.warp(block.timestamp + minimumTurnDuration);
+            vm.roll(block.number + 1);
+
+            bingo.drawNumber(1);
+            bingo.checkBoard(1, playerOne);
+            (, , , , , address winnerTemp, ) = bingo.getGame(1);
+
+            if (winnerTemp == playerOne) {
+                winner = winnerTemp;
+            }
+            j++;
+        }
+
+        // helperDrawNumbers(1, 300);
+        // bingo.checkBoard(1, playerOne);
         uint8[25] memory playerOneBoard = bingo.getPlayerBoard(1, playerOne);
 
         // user --vvvv to see full array of player and drawn numbers
         uint8[] memory numbers = bingo.getNumbersDrawn(1);
+        console.log("numbers drawn", numbers.length);
 
         // check if playerOne is winner
-        (, , , , , address winner, ) = bingo.getGame(1);
         assertEq(winner, playerOne);
     }
 
     function helperStartGameSingle() internal {
         bingo.startGame();
         vm.startPrank(playerOne);
-        bingo.joinGame(1);
+        uint32 gameId = bingo.CurrentGame();
+        bingo.joinGame(gameId);
         vm.stopPrank();
     }
 
